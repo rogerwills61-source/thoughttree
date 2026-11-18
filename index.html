@@ -544,7 +544,7 @@
         // while silently updating the cache in the background!
         if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
           const swCode = `
-            const CACHE = 'thoughttree-pwa-v27';
+            const CACHE = 'thoughttree-pwa-v28';
             self.addEventListener('install', () => { self.skipWaiting(); });
             self.addEventListener('activate', (e) => {
               e.waitUntil(
@@ -599,7 +599,7 @@
           <span>Menu</span>
           <span style="font-size:10px; opacity:0.8;">▾</span>
         </button>
-        <input type="file" id="fileInput" accept=".json,.md,.markdown,.mm,.xml,.txt" style="display:none" />
+        <input type="file" id="fileInput" style="display:none" />
 
         <button class="hud-btn icon-btn" id="btnSettings" title="UI & Canvas Settings (Ctrl/Cmd+,)" aria-label="Settings">
           <svg class="hud-icon cog-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -1305,14 +1305,20 @@
         return { ...state, nodesById: nextNodes };
       }
 
-      function hydrateAllNodeBounds(state) {
+      // ADR-039: Fast-Path Node Bounds Hydration — reuse cached metadata.width/height when already present
+      // so loading a mind map on mobile skips N synchronous canvas measureText() calls!
+      function hydrateAllNodeBounds(state, forceRemeasure = false) {
         const nextNodes = {};
         for (const [id, node] of Object.entries(state.nodesById)) {
-          const dims = measureNodeDimensions(node.text, id === state.rootId);
-          nextNodes[id] = {
-            ...node,
-            metadata: { ...node.metadata, width: dims.width, height: dims.height }
-          };
+          if (!forceRemeasure && node.metadata && node.metadata.width > 0 && node.metadata.height > 0) {
+            nextNodes[id] = node;
+          } else {
+            const dims = measureNodeDimensions(node.text, id === state.rootId);
+            nextNodes[id] = {
+              ...node,
+              metadata: { ...node.metadata, width: dims.width, height: dims.height }
+            };
+          }
         }
         return { ...state, nodesById: nextNodes };
       }
@@ -1339,17 +1345,28 @@
         t._timer = setTimeout(() => t.classList.remove('show'), 1800);
       }
 
+      // ADR-039: Persistent Singleton IndexedDB Connection (avoids opening a new IDB connection on every file load/keystroke)
+      let _cachedDbPromise = null;
       function openDB() {
-        return new Promise((resolve, reject) => {
+        if (_cachedDbPromise) return _cachedDbPromise;
+        _cachedDbPromise = new Promise((resolve, reject) => {
           const req = indexedDB.open(DB_NAME, 1);
           req.onupgradeneeded = () => {
             if (!req.result.objectStoreNames.contains(STORE_NAME)) {
               req.result.createObjectStore(STORE_NAME);
             }
           };
-          req.onsuccess = () => resolve(req.result);
-          req.onerror = () => reject(req.error);
+          req.onsuccess = () => {
+            const db = req.result;
+            db.onclose = () => { _cachedDbPromise = null; };
+            resolve(db);
+          };
+          req.onerror = () => {
+            _cachedDbPromise = null;
+            reject(req.error);
+          };
         });
+        return _cachedDbPromise;
       }
 
       // ADR-032 (v2.19): Store only filename & format in IndexedDB (never persist FileSystemFileHandle objects across sessions so file:/// never triggers browser permission prompts on click/keystroke!)
@@ -2065,12 +2082,25 @@
         } catch {}
       }
 
+      // ADR-039: Hot-Switch Channel Subscription without tearing down live TLS WebSockets!
+      // Closing and reopening 3 WSS connections on mobile every time a file is opened stalls the mobile main thread
+      // and delays sync by 1-2s. Instead, reuse open MQTT WebSockets and immediately send SUBSCRIBE for the new channelKey!
       function connectInvisibleCrossDeviceSync(forceReconnect = false) {
         const desiredKey = getPrivateFileChannelKey(currentState);
         if (!desiredKey) return;
 
-        if (desiredKey !== activeChannelKey || forceReconnect) {
-          closeAllSyncTransports();
+        const keyChanged = desiredKey !== activeChannelKey;
+        if (keyChanged || forceReconnect) {
+          // Close previous BroadcastChannel & previous file's WebRTC P2P peers, but KEEP healthy MQTT WebSockets open!
+          if (syncChannel) {
+            try { syncChannel.close(); } catch {}
+            syncChannel = null;
+          }
+          for (const peer of rtcPeers.values()) {
+            try { if (peer.dc) peer.dc.close(); } catch {}
+            try { if (peer.pc) peer.pc.close(); } catch {}
+          }
+          rtcPeers.clear();
           activeChannelKey = desiredKey;
 
           // Layer 1: Same-Browser BroadcastChannel bound strictly to the private channelKey
@@ -2085,6 +2115,28 @@
                 }
               };
             } catch {}
+          }
+
+          // Immediately subscribe already-connected MQTT WebSockets to the new channel topic & announce sync-hello
+          const subTopic = `thoughttree/v26/${activeChannelKey}`;
+          const subPkt = buildMqttSubscribePacket(subTopic, 1);
+          const helloEnv = {
+            type: 'sync-hello',
+            senderId: TAB_ID,
+            updatedAt: nextClock(),
+            mapId: currentState.mapId,
+            fileSyncToken: currentState.fileSyncToken,
+            state: buildSyncSnapshotPayload()
+          };
+          const helloPkt = buildMqttPublishPacket(subTopic, helloEnv, true);
+
+          for (const entry of mqttSockets.values()) {
+            if (entry.ws && entry.ws.readyState === WebSocket.OPEN && entry.connected) {
+              try {
+                entry.ws.send(subPkt);
+                entry.ws.send(helloPkt);
+              } catch {}
+            }
           }
         }
 
@@ -4291,7 +4343,12 @@
         miniCtx.strokeRect(camX, camY, camW, camH);
       }
 
+      let _ariaSyncTimer = null;
       function syncAriaTreeMirror() {
+        clearTimeout(_ariaSyncTimer);
+        _ariaSyncTimer = setTimeout(_runAriaTreeMirrorNow, 180);
+      }
+      function _runAriaTreeMirrorNow() {
         ariaTree.innerHTML = '';
         ariaTree.setAttribute('role', 'tree');
         ariaTree.setAttribute('aria-label', 'Mind Map Outline');
@@ -5150,6 +5207,7 @@
         await saveMapAs(activeFileFormat, false);
       }
 
+      // ADR-039: Render-First Non-Blocking File Loader (<16ms First Paint on Mobile)
       async function loadFileContent(name, text, handle = null) {
         let imported;
         let migratedToken = false;
@@ -5166,20 +5224,22 @@
           migratedToken = true;
         }
 
+        // Apply layout if any node is at (0,0) or missing coordinates
+        imported = applyAutoLayout(imported);
+
         activeFileHandle = handle;
         activeFileFormat = fmt;
         customFileName = name;
-        await saveFileHandleToIDB(handle, name, fmt);
-        commitState(imported, false);
+        currentState = imported;
+        past = [];
+        future = [];
+
+        // 1. Paint the newly opened mind map on screen IMMEDIATELY (0ms wait for IndexedDB or WebSockets!)
+        updateLayerBadge();
         updateFileBadge(name, migratedToken);
-        if (handle) {
-          try {
-            const f = await handle.getFile();
-            lastKnownDiskModified = f.lastModified;
-          } catch {}
-        }
-        connectInvisibleCrossDeviceSync(true);
-        pushStateToCrossDeviceSync(true);
+        fitToScreen();
+        drawFrame();
+
         if (migratedToken && fmt === 'json') {
           if (handle) {
             scheduleAutoSaveToDisk();
@@ -5192,7 +5252,21 @@
           setSaveStatus(handle ? 'saved' : 'local', handle ? `Linked to ${name}` : `Loaded ${name}`);
           showToast(`Opened ${name}`);
         }
-        fitToScreen();
+
+        // 2. Defer IndexedDB writes, ARIA mirror, and MQTT/WebRTC channel switch to background tick after paint
+        setTimeout(async () => {
+          syncAriaTreeMirror();
+          saveFileHandleToIDB(handle, name, fmt);
+          saveToIndexedDB(currentState, true);
+          if (handle) {
+            try {
+              const f = await handle.getFile();
+              lastKnownDiskModified = f.lastModified;
+            } catch {}
+          }
+          connectInvisibleCrossDeviceSync(false);
+          pushStateToCrossDeviceSync(true);
+        }, 20);
       }
 
       // ADR-037: Mobile File Open Ergonomics — always use clean <input type="file"> on mobile/touch viewports
@@ -5356,10 +5430,12 @@
       const fileInput = document.getElementById('fileInput');
       document.getElementById('btnImport').onclick = () => { fileMenu.classList.remove('open'); openMapFromDisk(); };
       fileInput.onchange = async (e) => {
-        const file = e.target.files[0];
+        const file = e.target.files && e.target.files[0];
         if (!file) return;
-        const text = await file.text();
+        setSaveStatus('saving', `Opening ${file.name}...`);
+        showToast(`Opening ${file.name}...`);
         try {
+          const text = await file.text();
           await loadFileContent(file.name, text, null);
         } catch (err) {
           alert('Import failed: ' + err.message);
