@@ -544,7 +544,7 @@
         // while silently updating the cache in the background!
         if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
           const swCode = `
-            const CACHE = 'thoughttree-pwa-v28';
+            const CACHE = 'thoughttree-pwa-v29';
             self.addEventListener('install', () => { self.skipWaiting(); });
             self.addEventListener('activate', (e) => {
               e.waitUntil(
@@ -5224,8 +5224,12 @@
           migratedToken = true;
         }
 
-        // Apply layout if any node is at (0,0) or missing coordinates
-        imported = applyAutoLayout(imported);
+        // ADR-040: Skip redundant O(N) applyAutoLayout calculation when opening saved .json files
+        // that already contain pre-calculated node positions, making file open instant on mobile!
+        const needsLayout = Object.values(imported.nodesById || {}).some((n) => !n.position || (n.position.x === 0 && n.position.y === 0));
+        if (needsLayout) {
+          imported = applyAutoLayout(imported);
+        }
 
         activeFileHandle = handle;
         activeFileFormat = fmt;
@@ -5429,18 +5433,20 @@
 
       const fileInput = document.getElementById('fileInput');
       document.getElementById('btnImport').onclick = () => { fileMenu.classList.remove('open'); openMapFromDisk(); };
-      fileInput.onchange = async (e) => {
+      fileInput.onchange = (e) => {
         const file = e.target.files && e.target.files[0];
         if (!file) return;
         setSaveStatus('saving', `Opening ${file.name}...`);
         showToast(`Opening ${file.name}...`);
-        try {
-          const text = await file.text();
-          await loadFileContent(file.name, text, null);
-        } catch (err) {
-          alert('Import failed: ' + err.message);
-        }
-        fileInput.value = '';
+        setTimeout(async () => {
+          try {
+            const text = await file.text();
+            await loadFileContent(file.name, text, null);
+          } catch (err) {
+            alert('Import failed: ' + err.message);
+          }
+          fileInput.value = '';
+        }, 10);
       };
 
       // =========================================================================
