@@ -121,6 +121,7 @@
     }
     #saveStatusPill.saving #saveStatusDot { background: #f59e0b; transform: scale(1.2); }
     #saveStatusPill.local #saveStatusDot { background: #38bdf8; }
+    #saveStatusPill.p2p #saveStatusDot { background: #10b981; box-shadow: 0 0 8px #10b981; }
     #saveStatusPill.permission #saveStatusDot { background: #f97316; }
 
     /* ADR-021: Hover & Mobile Tap Callout Popover for Node Notes & Hyperlinks */
@@ -438,7 +439,6 @@
       overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap;
     }
   </style>
-  <script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
   <meta name="theme-color" content="#0f172a" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -1089,10 +1089,22 @@
         };
       }
 
+      // ADR-037: 256-Bit Cryptographic Secret Generator (32 Random Bytes = 64 Hex Chars)
+      function generateCryptoToken() {
+        const arr = new Uint8Array(32);
+        if (window.crypto && window.crypto.getRandomValues) {
+          window.crypto.getRandomValues(arr);
+        } else {
+          for (let i = 0; i < 32; i++) arr[i] = Math.floor(Math.random() * 256);
+        }
+        return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
+      }
+
       function createBlankMapState(startEditing = true) {
         const root = createNode(null, 'ThoughtTree', true);
         return {
-          mapId: 'map_' + root.id,
+          mapId: 'map_' + uid(),
+          fileSyncToken: generateCryptoToken(),
           rootId: root.id,
           nodesById: { [root.id]: root },
           deletedById: {},
@@ -1106,12 +1118,12 @@
       }
 
       function createInitialState() {
-        const root = createNode(null, 'Central Topic', true);
+        const root = createNode(null, 'ThoughtTree', true);
         const b1 = createNode(root.id, 'Core Architecture');
         const b2 = createNode(root.id, 'Keyboard Flow');
         const b3 = createNode(root.id, 'UI & Themes');
         const c1 = createNode(b1.id, '60 FPS Canvas');
-        const c2 = createNode(b1.id, 'Flat nodesById Store');
+        const c2 = createNode(b1.id, 'File-Bound CRDT Sync');
         const c3 = createNode(b2.id, 'Tab = Child / Enter = Sibling');
         const c4 = createNode(b3.id, 'Dark / Light / Sepia');
         const c5 = createNode(b3.id, 'Bezier & Orthogonal Lines');
@@ -1122,6 +1134,8 @@
         b3.childrenIds = [c4.id, c5.id];
 
         const base = {
+          mapId: 'map_' + uid(),
+          fileSyncToken: generateCryptoToken(),
           rootId: root.id,
           nodesById: {
             [root.id]: root,
@@ -1292,7 +1306,7 @@
       const MAP_KEY = 'active_mindmap_v1';
       const HANDLE_KEY = 'active_file_handle_v1';
       const TAB_ID = uid();
-      const syncChannel = ('BroadcastChannel' in window) ? new BroadcastChannel('mindmap_multi_tab_sync_v1') : null;
+      let syncChannel = null;
       let pendingRemoteState = null;
       let lastLocalMutationAt = 0;
 
@@ -1360,13 +1374,22 @@
           const payload = { ...state, editingId: null, updatedAt: now, customFileName, activeFileFormat };
           tx.objectStore(STORE_NAME).put(payload, MAP_KEY);
           if (broadcast && syncChannel) {
-            syncChannel.postMessage({
-              type: 'STATE_UPDATED',
-              tabId: TAB_ID,
-              updatedAt: now,
-              customFileName,
-              state: payload
-            });
+            try {
+              syncChannel.postMessage({
+                type: 'CRDT_STATE_PUSH',
+                senderId: TAB_ID,
+                updatedAt: now,
+                customFileName,
+                state: {
+                  mapId: state.mapId,
+                  fileSyncToken: state.fileSyncToken,
+                  rootId: state.rootId,
+                  nodesById: state.nodesById,
+                  deletedById: state.deletedById || {},
+                  linksById: state.linksById || {}
+                }
+              });
+            } catch {}
           }
         } catch (err) {
           console.warn('IndexedDB save skipped:', err);
@@ -1403,43 +1426,68 @@
 
       
       // =========================================================================
-      // ADR-022 & ADR-023: Sub-50ms CRDT Per-Node Delta-Merge & Dual-Transport Sync
+      // ADR-037: Self-Healing Cryptographic File-Bound Sync Engine (<50ms Tri-Layer)
+      //   Layer 1: Same-Browser BroadcastChannel(channelKey)
+      //   Layer 2: Zero-Dependency Raw Binary MQTT v3.1.1 over Multi-Broker WebSockets
+      //   Layer 3: Direct Peer-to-Peer WebRTC DataChannels (RTCPeerConnection)
       // =========================================================================
       let lastKnownDiskModified = 0;
-      let activeSyncTopic = null;
-      let mqttClient = null;
-      let syncEventSource = null;
+      let activeChannelKey = null;
       let lastSentSyncHash = '';
       let isApplyingRemoteSync = false;
 
-      function getDeterministicSyncTopic(state) {
-        const rawKey = (customFileName ? customFileName.toLowerCase().trim() : '') || (state?.mapId) || (state?.rootId) || 'default_map';
-        let h1 = 0xdeadbeef ^ rawKey.length;
-        let h2 = 0x41c6ce57 ^ rawKey.length;
-        for (let i = 0; i < rawKey.length; i++) {
-          const ch = rawKey.charCodeAt(i);
-          h1 = Math.imul(h1 ^ ch, 2654435761);
-          h2 = Math.imul(h2 ^ ch, 1597334677);
+      const MQTT_BROKERS = [
+        'wss://broker.emqx.io:8084/mqtt',
+        'wss://broker.hivemq.com:8884/mqtt',
+        'wss://test.mosquitto.org:8081/mqtt'
+      ];
+      const mqttSockets = new Map(); // url -> { ws, connected, pingTimer, rxBuffer }
+      const rtcPeers = new Map();    // peerId -> { pc, dc, connected }
+      const utf8Enc = new TextEncoder();
+      const utf8Dec = new TextDecoder();
+
+      // 1. Strict File-Bound Channel Key Derivation (NEVER derived from mapTitle or customFileName)
+      function getPrivateFileChannelKey(state = currentState) {
+        if (!state || !state.mapId || !state.fileSyncToken || state.fileSyncToken.length < 32) {
+          return null;
         }
-        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-        const hex = (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
-        return `mm_crdt_v26_${hex}`;
+        return 'tt_v26_' + state.mapId.replace(/[^a-zA-Z0-9]/g, '') + '_' + state.fileSyncToken.slice(0, 40);
       }
 
       function computeStateSignature(state) {
-        return JSON.stringify({ r: state.rootId, n: state.nodesById, d: state.deletedById || {}, l: state.linksById || {} });
+        return JSON.stringify({
+          m: state.mapId,
+          t: state.fileSyncToken,
+          r: state.rootId,
+          n: state.nodesById,
+          d: state.deletedById || {},
+          l: state.linksById || {}
+        });
       }
 
-      // ADR-023: Conflict-Free Per-Node CRDT Merger (LWW-Element-Set + Order-Preserving Children Union)
+      function hasOpenWebRtcPeer() {
+        for (const peer of rtcPeers.values()) {
+          if (peer.dc && peer.dc.readyState === 'open') return true;
+        }
+        return false;
+      }
+
+      // 2. Conflict-Free LWW-Element-Set CRDT Merger with Strict Cryptographic Guard & Tombstones
       function mergeRemoteCRDTState(localState, remoteState) {
         if (!remoteState || !remoteState.rootId || !remoteState.nodesById) return null;
+        if (!localState || !localState.mapId || !localState.fileSyncToken || localState.fileSyncToken.length < 32) {
+          return null;
+        }
+        // SECURITY INVARIANT: Unconditional mapId + 256-bit fileSyncToken verification
+        if (remoteState.mapId !== localState.mapId || remoteState.fileSyncToken !== localState.fileSyncToken) {
+          return null;
+        }
 
-        // If the user opened a completely different root map, adopt it if remote is newer
+        // Step A (Merge Tombstones via Math.max)
         const mergedDeleted = { ...(localState.deletedById || {}) };
         for (const [delId, delTs] of Object.entries(remoteState.deletedById || {})) {
-          if (!mergedDeleted[delId] || delTs > mergedDeleted[delId]) {
-            mergedDeleted[delId] = delTs;
+          if (typeof delTs === 'number') {
+            mergedDeleted[delId] = Math.max(mergedDeleted[delId] || 0, delTs);
           }
         }
 
@@ -1449,6 +1497,7 @@
           ...Object.keys(remoteState.nodesById)
         ]);
 
+        // Step B & C (Merge Nodes by Last-Write-Wins while protecting active local edit/drag)
         const mergedNodes = {};
         for (const id of allIds) {
           const loc = localState.nodesById[id];
@@ -1457,22 +1506,39 @@
           const locTs = loc?.updatedAt || 1;
           const remTs = rem?.updatedAt || 1;
 
-          // Respect tombstone if deletion is newer than both local and remote node versions
-          if (id !== rootId && delTs > Math.max(locTs, remTs)) {
+          // Purge any node (except root) whose latest update timestamp is <= its tombstone timestamp
+          if (id !== rootId && delTs >= Math.max(locTs, remTs)) {
             continue;
           }
 
+          const isLocallyProtected = Boolean(
+            loc && (
+              localState.editingId === id ||
+              (typeof draggedNodeId !== 'undefined' && draggedNodeId && (draggedNodeId === id || (localState.selectedIds || []).includes(id)))
+            )
+          );
+
           if (loc && !rem) {
+            if (id !== rootId && delTs >= locTs) continue;
             mergedNodes[id] = { ...loc };
           } else if (!loc && rem) {
+            if (id !== rootId && delTs >= remTs) continue;
             const mappedParentId = rem.parentId === remoteState.rootId ? rootId : rem.parentId;
-            mergedNodes[id] = { ...rem, parentId: mappedParentId };
+            mergedNodes[id] = { ...rem, parentId: id === rootId ? null : mappedParentId };
+          } else if (isLocallyProtected) {
+            // Preserve local in-flight text/drag position while still unioning any new remote child IDs
+            const unionChildren = Array.from(new Set([...(loc.childrenIds || []), ...(rem.childrenIds || [])]));
+            mergedNodes[id] = {
+              ...loc,
+              childrenIds: unionChildren,
+              updatedAt: Math.max(locTs, remTs)
+            };
           } else {
-            // Both exist: Last-Writer-Wins per node for scalar properties, union for childrenIds!
-            const winner = remTs >= locTs ? rem : loc;
+            const remWins = remTs > locTs;
+            const winner = remWins ? rem : loc;
             const mappedParentId = winner.parentId === remoteState.rootId ? rootId : winner.parentId;
-            const primaryChildren = (remTs >= locTs ? rem.childrenIds : loc.childrenIds) || [];
-            const secondaryChildren = (remTs >= locTs ? loc.childrenIds : rem.childrenIds) || [];
+            const primaryChildren = (remWins ? rem.childrenIds : loc.childrenIds) || [];
+            const secondaryChildren = (remWins ? loc.childrenIds : rem.childrenIds) || [];
             const unionChildren = Array.from(new Set([...primaryChildren, ...secondaryChildren]));
 
             mergedNodes[id] = {
@@ -1484,7 +1550,7 @@
           }
         }
 
-        // Reconcile parent -> children pointers so no child is orphaned or duplicated
+        // Reconcile parent -> children pointers so no child is orphaned, tombstoned, or duplicated
         for (const id of Object.keys(mergedNodes)) {
           mergedNodes[id].childrenIds = (mergedNodes[id].childrenIds || []).filter(
             (cid) => mergedNodes[cid] && mergedNodes[cid].parentId === id
@@ -1500,7 +1566,7 @@
           }
         }
 
-        // Merge non-hierarchical cross-links (linksById) via LWW + tombstones
+        // Merge non-hierarchical cross-links (linksById) via LWW + tombstones + active link-label edit lock
         const mergedLinks = {};
         const allLinkIds = new Set([
           ...Object.keys(localState.linksById || {}),
@@ -1510,22 +1576,32 @@
           const lLoc = localState.linksById?.[lid];
           const lRem = remoteState.linksById?.[lid];
           const delTs = mergedDeleted[lid] || 0;
-          const winner = (lRem?.updatedAt || 0) >= (lLoc?.updatedAt || 0) ? (lRem || lLoc) : (lLoc || lRem);
-          if (!winner || delTs > (winner.updatedAt || 0)) continue;
+          if (lLoc && localState.editingLinkId === lid) {
+            mergedLinks[lid] = { ...lLoc };
+            continue;
+          }
+          const winner = (lRem?.updatedAt || 0) > (lLoc?.updatedAt || 0) ? (lRem || lLoc) : (lLoc || lRem);
+          if (!winner || delTs >= (winner.updatedAt || 0)) continue;
           if (mergedNodes[winner.fromId] && mergedNodes[winner.toId]) {
             mergedLinks[lid] = winner;
           }
         }
 
+        // Note: viewport (offsetX, offsetY, scale) is NEVER touched by remote sync
         return applyAutoLayout(hydrateAllNodeBounds({
-          mapId: localState.mapId || remoteState.mapId || ('map_' + rootId),
+          ...localState,
+          mapId: localState.mapId,
+          fileSyncToken: localState.fileSyncToken,
           rootId,
           nodesById: mergedNodes,
           deletedById: mergedDeleted,
           linksById: mergedLinks,
           selectedId: localState.selectedId && mergedNodes[localState.selectedId] ? localState.selectedId : rootId,
-          selectedIds: [localState.selectedId && mergedNodes[localState.selectedId] ? localState.selectedId : rootId],
-          editingId: localState.editingId
+          selectedIds: (localState.selectedIds || []).filter((sid) => mergedNodes[sid]).length > 0
+            ? (localState.selectedIds || []).filter((sid) => mergedNodes[sid])
+            : [rootId],
+          editingId: localState.editingId && mergedNodes[localState.editingId] ? localState.editingId : null,
+          editingLinkId: localState.editingLinkId && mergedLinks[localState.editingLinkId] ? localState.editingLinkId : null
         }));
       }
 
@@ -1545,107 +1621,517 @@
         syncAriaTreeMirror();
         updateLayerBadge();
         saveToIndexedDB(currentState, false);
+        const rootText = currentState.nodesById[currentState.rootId]?.text || 'ThoughtTree';
+        updateFileBadge(customFileName || rootText, false);
+
         if (activeFileHandle) {
           scheduleAutoSaveToDisk();
         } else {
           const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-          setSaveStatus('saved', `${sourceLabel} · ${nowStr}`);
+          if (hasOpenWebRtcPeer()) {
+            setSaveStatus('p2p', `⚡ P2P Live · ${nowStr}`);
+          } else {
+            setSaveStatus('saved', `${sourceLabel} · ${nowStr}`);
+          }
         }
         requestRender();
         isApplyingRemoteSync = false;
       }
 
-      function connectInvisibleCrossDeviceSync() {
-        const desiredTopic = getDeterministicSyncTopic(currentState);
-        if (desiredTopic === activeSyncTopic && (mqttClient || syncEventSource)) return;
+      // =========================================================================
+      // Layer 2: Raw Binary MQTT v3.1.1 Packet Builders & Multi-Byte VarInt Parser
+      // =========================================================================
+      function mqttEncodeVarInt(len) {
+        const bytes = [];
+        do {
+          let encoded = len % 128;
+          len = Math.floor(len / 128);
+          if (len > 0) encoded |= 128;
+          bytes.push(encoded);
+        } while (len > 0);
+        return bytes;
+      }
 
-        if (mqttClient) {
-          try { mqttClient.end(true); } catch {}
-          mqttClient = null;
-        }
-        if (syncEventSource) {
-          try { syncEventSource.close(); } catch {}
-          syncEventSource = null;
-        }
-        activeSyncTopic = desiredTopic;
+      function mqttEncodeString(str) {
+        const buf = utf8Enc.encode(str);
+        const out = new Uint8Array(2 + buf.length);
+        out[0] = (buf.length >> 8) & 0xff;
+        out[1] = buf.length & 0xff;
+        out.set(buf, 2);
+        return out;
+      }
 
-        // Transport 1 (Primary Sub-50ms Fast-Path): Persistent WebSocket MQTT Broker
-        if (window.mqtt && typeof window.mqtt.connect === 'function') {
-          try {
-            mqttClient = window.mqtt.connect('wss://broker.emqx.io:8084/mqtt', {
-              clientId: 'mm_' + TAB_ID + '_' + Math.random().toString(36).slice(2, 6),
-              clean: true,
-              connectTimeout: 4000,
-              reconnectPeriod: 1500
-            });
-            mqttClient.on('connect', () => {
-              mqttClient.subscribe(`mindmap/crdt/${activeSyncTopic}`, { qos: 0 });
-              // Broadcast current state on join so any peer immediately converges
-              pushStateToCrossDeviceSync(true);
-            });
-            mqttClient.on('message', (_topic, payloadBuf) => {
-              try {
-                const packet = JSON.parse(payloadBuf.toString());
-                if (!packet || packet.senderId === TAB_ID) return;
-                if (packet.state) applyIncomingRemoteState(packet.state, 'Synced live');
-              } catch {}
-            });
-          } catch {}
+      function buildMqttConnectPacket(clientId) {
+        const protoName = mqttEncodeString('MQTT');
+        const cidBytes = mqttEncodeString(clientId);
+        // Variable header: Protocol Name ("MQTT"), Protocol Level (4 = v3.1.1), Connect Flags (0x02 = Clean Session), Keep Alive (45s)
+        const varHeader = new Uint8Array(protoName.length + 4);
+        varHeader.set(protoName, 0);
+        varHeader[protoName.length] = 0x04;
+        varHeader[protoName.length + 1] = 0x02;
+        varHeader[protoName.length + 2] = 0x00;
+        varHeader[protoName.length + 3] = 45;
+
+        const remLen = varHeader.length + cidBytes.length;
+        const lenBytes = mqttEncodeVarInt(remLen);
+        const pkt = new Uint8Array(1 + lenBytes.length + remLen);
+        pkt[0] = 0x10; // CONNECT
+        pkt.set(lenBytes, 1);
+        pkt.set(varHeader, 1 + lenBytes.length);
+        pkt.set(cidBytes, 1 + lenBytes.length + varHeader.length);
+        return pkt;
+      }
+
+      function buildMqttSubscribePacket(topic, packetId = 1) {
+        const topicBytes = mqttEncodeString(topic);
+        const remLen = 2 + topicBytes.length + 1;
+        const lenBytes = mqttEncodeVarInt(remLen);
+        const pkt = new Uint8Array(1 + lenBytes.length + remLen);
+        pkt[0] = 0x82; // SUBSCRIBE (QoS 1 required in fixed header bits 0010)
+        pkt.set(lenBytes, 1);
+        let offset = 1 + lenBytes.length;
+        pkt[offset++] = (packetId >> 8) & 0xff;
+        pkt[offset++] = packetId & 0xff;
+        pkt.set(topicBytes, offset);
+        offset += topicBytes.length;
+        pkt[offset] = 0x00; // Requested QoS 0
+        return pkt;
+      }
+
+      function buildMqttPublishPacket(topic, payloadObj, retain = false) {
+        const topicBytes = mqttEncodeString(topic);
+        const payloadBytes = utf8Enc.encode(typeof payloadObj === 'string' ? payloadObj : JSON.stringify(payloadObj));
+        const remLen = topicBytes.length + payloadBytes.length;
+        const lenBytes = mqttEncodeVarInt(remLen);
+        const pkt = new Uint8Array(1 + lenBytes.length + remLen);
+        pkt[0] = retain ? 0x31 : 0x30; // PUBLISH QoS 0
+        pkt.set(lenBytes, 1);
+        pkt.set(topicBytes, 1 + lenBytes.length);
+        pkt.set(payloadBytes, 1 + lenBytes.length + topicBytes.length);
+        return pkt;
+      }
+
+      function buildMqttPingReqPacket() {
+        return new Uint8Array([0xc0, 0x00]); // PINGREQ
+      }
+
+      // Multi-Byte Variable Byte Integer Decoder for Streaming MQTT Frames (handles >127B & >16KB map snapshots without truncation)
+      function parseIncomingMqttFrames(entry, chunkUint8) {
+        const prev = entry.rxBuffer || new Uint8Array(0);
+        const combined = new Uint8Array(prev.length + chunkUint8.length);
+        combined.set(prev, 0);
+        combined.set(chunkUint8, prev.length);
+
+        let offset = 0;
+        while (offset < combined.length) {
+          if (offset + 2 > combined.length) break;
+          const headerByte = combined[offset];
+          let multiplier = 1;
+          let remValue = 0;
+          let lenIdx = offset + 1;
+          let completeLen = false;
+
+          while (lenIdx < combined.length) {
+            const encodedByte = combined[lenIdx++];
+            remValue += (encodedByte & 127) * multiplier;
+            if ((encodedByte & 128) === 0) {
+              completeLen = true;
+              break;
+            }
+            multiplier *= 128;
+            if (multiplier > 128 * 128 * 128) break;
+          }
+
+          if (!completeLen) break; // Wait for more bytes
+          const frameEnd = lenIdx + remValue;
+          if (frameEnd > combined.length) break; // Full payload not yet arrived
+
+          const packetType = (headerByte >> 4) & 0x0f;
+          const qos = (headerByte >> 1) & 0x03;
+
+          if (packetType === 2) {
+            // CONNACK (0x20) -> Subscribe to activeChannelKey and announce presence
+            entry.connected = true;
+            if (activeChannelKey && entry.ws.readyState === WebSocket.OPEN) {
+              const subTopic = `thoughttree/v26/${activeChannelKey}`;
+              entry.ws.send(buildMqttSubscribePacket(subTopic, 1));
+              sendEnvelopeOverMqtt({
+                type: 'sync-hello',
+                senderId: TAB_ID,
+                mapId: currentState.mapId,
+                fileSyncToken: currentState.fileSyncToken,
+                state: buildSyncSnapshotPayload()
+              });
+            }
+          } else if (packetType === 3) {
+            // PUBLISH (0x30)
+            let pIdx = lenIdx;
+            if (pIdx + 2 <= frameEnd) {
+              const topicLen = (combined[pIdx] << 8) | combined[pIdx + 1];
+              pIdx += 2 + topicLen;
+              if (qos > 0) pIdx += 2; // Skip Packet Identifier if QoS 1/2
+              if (pIdx <= frameEnd) {
+                const payloadSlice = combined.subarray(pIdx, frameEnd);
+                try {
+                  const text = utf8Dec.decode(payloadSlice);
+                  const env = JSON.parse(text);
+                  handleIncomingSyncEnvelope(env, 'MQTT Live');
+                } catch {}
+              }
+            }
+          }
+          offset = frameEnd;
         }
 
-        // Transport 2 (Fallback SSE Stream if MQTT WebSocket is blocked by firewall)
-        try {
-          const es = new EventSource(`https://ntfy.sh/${activeSyncTopic}/sse`);
-          syncEventSource = es;
-          es.onmessage = (ev) => {
+        entry.rxBuffer = combined.subarray(offset);
+      }
+
+      function buildSyncSnapshotPayload() {
+        return {
+          mapId: currentState.mapId,
+          fileSyncToken: currentState.fileSyncToken,
+          rootId: currentState.rootId,
+          nodesById: currentState.nodesById,
+          deletedById: currentState.deletedById || {},
+          linksById: currentState.linksById || {}
+        };
+      }
+
+      function sendEnvelopeOverMqtt(envelopeObj, retain = false) {
+        if (!activeChannelKey) return false;
+        const topic = `thoughttree/v26/${activeChannelKey}`;
+        const pkt = buildMqttPublishPacket(topic, envelopeObj, retain);
+        let sentAny = false;
+        for (const entry of mqttSockets.values()) {
+          if (entry.ws && entry.ws.readyState === WebSocket.OPEN && entry.connected) {
             try {
-              const wrapper = JSON.parse(ev.data);
-              if (!wrapper || !wrapper.message) return;
-              const packet = JSON.parse(wrapper.message);
-              if (!packet || packet.senderId === TAB_ID) return;
-              if (packet.state) applyIncomingRemoteState(packet.state, 'Synced live');
+              entry.ws.send(pkt);
+              sentAny = true;
             } catch {}
+          }
+        }
+        return sentAny;
+      }
+
+      // =========================================================================
+      // Layer 3: Direct Peer-to-Peer WebRTC DataChannels (Signaled over Private MQTT Topic)
+      // =========================================================================
+      function updateP2PStatusIndicator() {
+        if (hasOpenWebRtcPeer() && !activeFileHandle) {
+          const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          setSaveStatus('p2p', `⚡ P2P Live · ${nowStr}`);
+        }
+      }
+
+      function bindDataChannelEvents(remotePeerId, dc) {
+        dc.onopen = () => {
+          updateP2PStatusIndicator();
+          // Immediately exchange current CRDT state over the newly opened <50ms P2P DataChannel
+          try {
+            dc.send(JSON.stringify({
+              type: 'crdt-state',
+              senderId: TAB_ID,
+              mapId: currentState.mapId,
+              fileSyncToken: currentState.fileSyncToken,
+              state: buildSyncSnapshotPayload()
+            }));
+          } catch {}
+        };
+        dc.onclose = () => {
+          updateP2PStatusIndicator();
+        };
+        dc.onmessage = (ev) => {
+          try {
+            const env = JSON.parse(ev.data);
+            handleIncomingSyncEnvelope(env, '⚡ P2P Live');
+          } catch {}
+        };
+      }
+
+      function getOrCreateRtcPeer(remotePeerId, isInitiator) {
+        if (rtcPeers.has(remotePeerId)) {
+          const existing = rtcPeers.get(remotePeerId);
+          if (existing.pc && existing.pc.connectionState !== 'failed' && existing.pc.connectionState !== 'closed') {
+            return existing;
+          }
+          try { existing.pc.close(); } catch {}
+          rtcPeers.delete(remotePeerId);
+        }
+
+        if (typeof RTCPeerConnection === 'undefined') return null;
+        const pc = new RTCPeerConnection({
+          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        });
+        const peerEntry = { pc, dc: null };
+        rtcPeers.set(remotePeerId, peerEntry);
+
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate) {
+            sendEnvelopeOverMqtt({
+              type: 'webrtc-ice',
+              senderId: TAB_ID,
+              targetId: remotePeerId,
+              mapId: currentState.mapId,
+              fileSyncToken: currentState.fileSyncToken,
+              candidate: ev.candidate
+            });
+          }
+        };
+
+        pc.onconnectionstatechange = () => {
+          if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+            updateP2PStatusIndicator();
+          }
+        };
+
+        if (isInitiator) {
+          const dc = pc.createDataChannel('thoughttree_crdt_p2p', { ordered: true });
+          peerEntry.dc = dc;
+          bindDataChannelEvents(remotePeerId, dc);
+          pc.createOffer()
+            .then((offer) => pc.setLocalDescription(offer))
+            .then(() => {
+              sendEnvelopeOverMqtt({
+                type: 'webrtc-offer',
+                senderId: TAB_ID,
+                targetId: remotePeerId,
+                mapId: currentState.mapId,
+                fileSyncToken: currentState.fileSyncToken,
+                sdp: pc.localDescription
+              });
+            })
+            .catch(() => {});
+        } else {
+          pc.ondatachannel = (ev) => {
+            peerEntry.dc = ev.channel;
+            bindDataChannelEvents(remotePeerId, ev.channel);
+          };
+        }
+
+        return peerEntry;
+      }
+
+      async function handleIncomingSyncEnvelope(env, transportLabel = 'Synced live') {
+        if (!env || env.senderId === TAB_ID) return;
+        // Security Invariant: Drop any signaling or state packet lacking the exact mapId + fileSyncToken
+        if (
+          !currentState.mapId ||
+          !currentState.fileSyncToken ||
+          env.mapId !== currentState.mapId ||
+          env.fileSyncToken !== currentState.fileSyncToken
+        ) {
+          return;
+        }
+
+        if (env.state) {
+          applyIncomingRemoteState(env.state, transportLabel);
+        }
+
+        if (env.type === 'sync-hello') {
+          // Deterministic tie-breaker so only one side initiates the WebRTC offer
+          const shouldInitiate = TAB_ID > env.senderId;
+          if (shouldInitiate) {
+            getOrCreateRtcPeer(env.senderId, true);
+          } else {
+            // Reply with our current state so the newcomer converges immediately
+            sendEnvelopeOverMqtt({
+              type: 'crdt-state',
+              senderId: TAB_ID,
+              mapId: currentState.mapId,
+              fileSyncToken: currentState.fileSyncToken,
+              state: buildSyncSnapshotPayload()
+            });
+          }
+        } else if (env.type === 'webrtc-offer' && env.targetId === TAB_ID && env.sdp) {
+          const peerEntry = getOrCreateRtcPeer(env.senderId, false);
+          if (peerEntry && peerEntry.pc) {
+            try {
+              await peerEntry.pc.setRemoteDescription(new RTCSessionDescription(env.sdp));
+              const answer = await peerEntry.pc.createAnswer();
+              await peerEntry.pc.setLocalDescription(answer);
+              sendEnvelopeOverMqtt({
+                type: 'webrtc-answer',
+                senderId: TAB_ID,
+                targetId: env.senderId,
+                mapId: currentState.mapId,
+                fileSyncToken: currentState.fileSyncToken,
+                sdp: peerEntry.pc.localDescription
+              });
+            } catch {}
+          }
+        } else if (env.type === 'webrtc-answer' && env.targetId === TAB_ID && env.sdp) {
+          const peerEntry = rtcPeers.get(env.senderId);
+          if (peerEntry && peerEntry.pc && peerEntry.pc.signalingState === 'have-local-offer') {
+            try {
+              await peerEntry.pc.setRemoteDescription(new RTCSessionDescription(env.sdp));
+            } catch {}
+          }
+        } else if (env.type === 'webrtc-ice' && env.targetId === TAB_ID && env.candidate) {
+          const peerEntry = rtcPeers.get(env.senderId);
+          if (peerEntry && peerEntry.pc) {
+            try {
+              await peerEntry.pc.addIceCandidate(new RTCIceCandidate(env.candidate));
+            } catch {}
+          }
+        }
+      }
+
+      function closeAllSyncTransports() {
+        if (syncChannel) {
+          try { syncChannel.close(); } catch {}
+          syncChannel = null;
+        }
+        for (const entry of mqttSockets.values()) {
+          clearInterval(entry.pingTimer);
+          try { entry.ws.close(); } catch {}
+        }
+        mqttSockets.clear();
+        for (const peer of rtcPeers.values()) {
+          try { if (peer.dc) peer.dc.close(); } catch {}
+          try { if (peer.pc) peer.pc.close(); } catch {}
+        }
+        rtcPeers.clear();
+      }
+
+      function ensureBrokerSocketConnected(brokerUrl) {
+        const existing = mqttSockets.get(brokerUrl);
+        if (existing && existing.ws && (existing.ws.readyState === WebSocket.OPEN || existing.ws.readyState === WebSocket.CONNECTING)) {
+          return;
+        }
+        if (existing) {
+          clearInterval(existing.pingTimer);
+          try { existing.ws.close(); } catch {}
+          mqttSockets.delete(brokerUrl);
+        }
+
+        try {
+          const ws = new WebSocket(brokerUrl, 'mqtt');
+          ws.binaryType = 'arraybuffer';
+          const entry = { ws, connected: false, pingTimer: null, rxBuffer: new Uint8Array(0) };
+          mqttSockets.set(brokerUrl, entry);
+
+          ws.onopen = () => {
+            const clientId = 'tt_' + TAB_ID.replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) + '_' + Math.random().toString(36).slice(2, 6);
+            try {
+              ws.send(buildMqttConnectPacket(clientId));
+            } catch {}
+            // 20-second PINGREQ keepalive heartbeat to prevent mobile NAT / sleep disconnects
+            entry.pingTimer = setInterval(() => {
+              if (ws.readyState === WebSocket.OPEN && entry.connected) {
+                try { ws.send(buildMqttPingReqPacket()); } catch {}
+              }
+            }, 20000);
+          };
+
+          ws.onmessage = (ev) => {
+            if (ev.data instanceof ArrayBuffer) {
+              parseIncomingMqttFrames(entry, new Uint8Array(ev.data));
+            } else if (Blob && ev.data instanceof Blob) {
+              ev.data.arrayBuffer().then((buf) => parseIncomingMqttFrames(entry, new Uint8Array(buf))).catch(() => {});
+            }
+          };
+
+          ws.onclose = () => {
+            entry.connected = false;
+            clearInterval(entry.pingTimer);
+          };
+          ws.onerror = () => {
+            entry.connected = false;
           };
         } catch {}
       }
 
-      let sseFallbackTimer = null;
+      function connectInvisibleCrossDeviceSync(forceReconnect = false) {
+        const desiredKey = getPrivateFileChannelKey(currentState);
+        if (!desiredKey) return;
+
+        if (desiredKey !== activeChannelKey || forceReconnect) {
+          closeAllSyncTransports();
+          activeChannelKey = desiredKey;
+
+          // Layer 1: Same-Browser BroadcastChannel bound strictly to the private channelKey
+          if ('BroadcastChannel' in window) {
+            try {
+              syncChannel = new BroadcastChannel(activeChannelKey);
+              syncChannel.onmessage = (ev) => {
+                const msg = ev.data;
+                if (!msg || msg.senderId === TAB_ID) return;
+                if (msg.state) {
+                  applyIncomingRemoteState(msg.state, 'Synced tab');
+                }
+              };
+            } catch {}
+          }
+        }
+
+        // Layer 2: Ensure all 3 resilient public WSS MQTT brokers are connected
+        for (const url of MQTT_BROKERS) {
+          ensureBrokerSocketConnected(url);
+        }
+      }
+
       function pushStateToCrossDeviceSync(force = false) {
         if (isApplyingRemoteSync) return;
-        connectInvisibleCrossDeviceSync();
+        connectInvisibleCrossDeviceSync(false);
+        if (!activeChannelKey) return;
 
         const sig = computeStateSignature(currentState);
         if (!force && sig === lastSentSyncHash) return;
         lastSentSyncHash = sig;
 
-        const packet = JSON.stringify({
+        const snapshot = buildSyncSnapshotPayload();
+        const envelope = {
+          type: 'crdt-state',
           senderId: TAB_ID,
           updatedAt: nextClock(),
-          state: {
-            mapId: currentState.mapId || ('map_' + currentState.rootId),
-            rootId: currentState.rootId,
-            nodesById: currentState.nodesById,
-            deletedById: currentState.deletedById || {},
-            linksById: currentState.linksById || {}
-          }
-        });
+          mapId: currentState.mapId,
+          fileSyncToken: currentState.fileSyncToken,
+          state: snapshot
+        };
 
-        // 1. Instant 0ms publish over persistent WebSocket MQTT (<50ms cross-device delivery)
-        if (mqttClient && mqttClient.connected) {
-          try {
-            mqttClient.publish(`mindmap/crdt/${activeSyncTopic}`, packet, { qos: 0, retain: true });
-            return;
-          } catch {}
+        // Layer 1: BroadcastChannel (0ms same-device tab sync)
+        if (syncChannel) {
+          try { syncChannel.postMessage(envelope); } catch {}
         }
 
-        // 2. Fallback HTTP POST if MQTT is still connecting
-        clearTimeout(sseFallbackTimer);
-        sseFallbackTimer = setTimeout(async () => {
-          try {
-            await fetch(`https://ntfy.sh/${activeSyncTopic}`, { method: 'POST', body: packet });
-          } catch {}
-        }, 120);
+        // Layer 3: Direct P2P WebRTC DataChannels (<50ms direct peer sync)
+        let sentViaWebRtc = false;
+        const rawJson = JSON.stringify(envelope);
+        for (const peer of rtcPeers.values()) {
+          if (peer.dc && peer.dc.readyState === 'open') {
+            try {
+              peer.dc.send(rawJson);
+              sentViaWebRtc = true;
+            } catch {}
+          }
+        }
+        if (sentViaWebRtc && !activeFileHandle) {
+          const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          setSaveStatus('p2p', `⚡ P2P Live · ${nowStr}`);
+        }
+
+        // Layer 2: Multi-Broker Binary MQTT over WebSockets (Cross-network relay + retained state for newly waking peers)
+        sendEnvelopeOverMqtt(envelope, true);
       }
+
+      // Automatic Wake / Network-Switch Self-Healing Listeners
+      function healSyncConnectionsOnWake() {
+        if (document.visibilityState === 'hidden') return;
+        connectInvisibleCrossDeviceSync(false);
+        sendEnvelopeOverMqtt({
+          type: 'sync-hello',
+          senderId: TAB_ID,
+          mapId: currentState.mapId,
+          fileSyncToken: currentState.fileSyncToken,
+          state: buildSyncSnapshotPayload()
+        });
+        pushStateToCrossDeviceSync(true);
+      }
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') healSyncConnectionsOnWake();
+      });
+      window.addEventListener('online', healSyncConnectionsOnWake);
+      window.addEventListener('focus', healSyncConnectionsOnWake);
 
       // Poll activeFileHandle on disk every 1.5s so external cloud-drive changes also merge cleanly via CRDT
       setInterval(async () => {
@@ -1657,7 +2143,7 @@
             const text = await file.text();
             const fmt = detectFormatFromName(file.name);
             let imported = null;
-            if (fmt === 'json') imported = importFromJSON(text);
+            if (fmt === 'json') imported = importFromJSON(text).state;
             else if (fmt === 'mm') imported = importFromFreeMindMM(text);
             else imported = importFromMarkdown(text);
             if (imported) {
@@ -2063,8 +2549,12 @@
         }
 
         const nextState = applyAutoLayout({
+          mapId: 'map_' + uid(),
+          fileSyncToken: generateCryptoToken(),
           rootId: root.id,
           nodesById,
+          deletedById: {},
+          linksById: {},
           selectedId: root.id,
           selectedIds: [root.id],
           editingId: null
@@ -2905,8 +3395,11 @@
       // =========================================================================
       function exportToJSON(state) {
         return JSON.stringify({
-          version: '2.5',
+          version: '2.6',
           mapId: state.mapId || ('map_' + state.rootId),
+          fileSyncToken: (state.fileSyncToken && state.fileSyncToken.length >= 32)
+            ? state.fileSyncToken
+            : generateCryptoToken(),
           updatedAt: Date.now(),
           rootId: state.rootId,
           nodesById: state.nodesById,
@@ -2916,6 +3409,8 @@
         }, null, 2);
       }
 
+      // ADR-037: Backward-Compatibility Migration on File Open
+      // Returns { state, migratedToken } so legacy JSON files lacking fileSyncToken immediately receive one and mark dirty
       function importFromJSON(raw) {
         const parsed = JSON.parse(raw);
         if (!parsed.rootId || !parsed.nodesById?.[parsed.rootId]) {
@@ -2925,8 +3420,13 @@
           uiConfig = { ...defaultConfig, ...parsed.uiConfig, focusMode: 'off' };
           applyBodyThemeAndFocus();
         }
-        return hydrateAllNodeBounds({
-          mapId: parsed.mapId || ('map_' + parsed.rootId),
+        const hasValidToken = typeof parsed.fileSyncToken === 'string' && parsed.fileSyncToken.length >= 32;
+        const resolvedToken = hasValidToken ? parsed.fileSyncToken : generateCryptoToken();
+        const resolvedMapId = parsed.mapId || ('map_' + parsed.rootId);
+
+        const state = hydrateAllNodeBounds({
+          mapId: resolvedMapId,
+          fileSyncToken: resolvedToken,
           rootId: parsed.rootId,
           nodesById: parsed.nodesById,
           linksById: parsed.linksById || {},
@@ -2935,6 +3435,7 @@
           selectedIds: [parsed.rootId],
           editingId: null
         });
+        return { state, migratedToken: !hasValidToken };
       }
 
       function exportToMarkdown(state) {
@@ -2971,8 +3472,12 @@
           stack.push({ id: node.id, depth });
         }
         return applyAutoLayout({
+          mapId: 'map_' + uid(),
+          fileSyncToken: generateCryptoToken(),
           rootId: root.id,
           nodesById,
+          deletedById: {},
+          linksById: {},
           selectedId: root.id,
           selectedIds: [root.id],
           editingId: null
@@ -3013,8 +3518,12 @@
         };
         const rootId = parseXmlNode(rootXml, null, true);
         return applyAutoLayout({
+          mapId: 'map_' + uid(),
+          fileSyncToken: generateCryptoToken(),
           rootId,
           nodesById,
+          deletedById: {},
+          linksById: {},
           selectedId: rootId,
           selectedIds: [rootId],
           editingId: null
@@ -4444,11 +4953,26 @@
         return 'json';
       }
 
-      function fallbackDownloadWithPrompt(defaultFormat = 'json') {
+      // ADR-037: Rotate both mapId and 256-bit fileSyncToken ONLY when branching a map into a brand-new file via Save As
+      function rotateMapIdentityForBranch() {
+        currentState = {
+          ...currentState,
+          mapId: 'map_' + uid(),
+          fileSyncToken: generateCryptoToken()
+        };
+        saveToIndexedDB(currentState, false);
+        connectInvisibleCrossDeviceSync(true);
+        pushStateToCrossDeviceSync(true);
+      }
+
+      function fallbackDownloadWithPrompt(defaultFormat = 'json', isSaveAsBranch = false) {
         const { ext } = serializeByFormat(defaultFormat);
         const suggested = `${getSuggestedBaseName()}${ext}`;
         const chosen = window.prompt('Enter file name (.json, .md, or .mm):', suggested);
         if (!chosen) return;
+        if (isSaveAsBranch) {
+          rotateMapIdentityForBranch();
+        }
         const fmt = detectFormatFromName(chosen);
         const { content, mime, ext: resolvedExt } = serializeByFormat(fmt);
         const finalName = chosen.includes('.') ? chosen.trim() : `${chosen.trim()}${resolvedExt}`;
@@ -4481,11 +5005,12 @@
         }
       }
 
-      async function saveMapAs(preferredFormat = 'json') {
+      async function saveMapAs(preferredFormat = 'json', rotateIdentity = true) {
         const { ext } = serializeByFormat(preferredFormat);
         const suggestedName = `${getSuggestedBaseName()}${ext}`;
+        const isMobile = window.innerWidth <= 820 || window.matchMedia('(pointer: coarse)').matches;
 
-        if ('showSaveFilePicker' in window) {
+        if (!isMobile && 'showSaveFilePicker' in window) {
           try {
             const types = [
               { description: 'MindMap JSON (.json)', accept: { 'application/json': ['.json'] } },
@@ -4496,6 +5021,9 @@
             else if (preferredFormat === 'mm') types.unshift(types.splice(2, 1)[0]);
 
             const handle = await window.showSaveFilePicker({ suggestedName, types });
+            if (rotateIdentity) {
+              rotateMapIdentityForBranch();
+            }
             activeFileHandle = handle;
             customFileName = handle.name;
             activeFileFormat = detectFormatFromName(handle.name);
@@ -4506,13 +5034,13 @@
             if (err && err.name === 'AbortError') return;
           }
         }
-        fallbackDownloadWithPrompt(preferredFormat);
+        fallbackDownloadWithPrompt(preferredFormat, rotateIdentity);
       }
 
       async function writeToActiveHandle() {
-        if (!activeFileHandle) return saveMapAs(activeFileFormat);
+        if (!activeFileHandle) return saveMapAs(activeFileFormat, false);
         const permitted = await verifyHandleReadWritePermission(activeFileHandle);
-        if (!permitted) return saveMapAs(activeFileFormat);
+        if (!permitted) return saveMapAs(activeFileFormat, false);
 
         const { content } = serializeByFormat(activeFileFormat);
         const writable = await activeFileHandle.createWritable();
@@ -4523,6 +5051,10 @@
       }
 
       async function saveMap() {
+        // ADR-037: NEVER rotate mapId or fileSyncToken on normal Save (Ctrl+S) so all devices with this file stay synced!
+        if (!currentState.fileSyncToken || currentState.fileSyncToken.length < 32) {
+          currentState.fileSyncToken = generateCryptoToken();
+        }
         // 1. If we have an active FileSystemFileHandle, write directly to that exact file on disk!
         if (activeFileHandle) {
           try {
@@ -4534,9 +5066,8 @@
             console.warn('Direct write failed, falling back:', err);
           }
         }
-        // 2. If a file was already opened or named (customFileName is known) but no FileSystemFileHandle exists
-        //    (e.g., opened via fallback <input type="file"> or running in an environment where showOpenFilePicker is blocked),
-        //    save immediately using that existing filename without prompting for a name or location!
+        // 2. If a file was already opened or named (customFileName is known) but no FileSystemFileHandle exists,
+        //    save immediately using that existing filename and preserving its mapId + fileSyncToken!
         if (customFileName) {
           const { content, mime } = serializeByFormat(activeFileFormat);
           const blob = new Blob([content], { type: mime });
@@ -4552,37 +5083,54 @@
           showToast(`Saved ${customFileName}`);
           return;
         }
-        // 3. Only if the map has never been named/opened before, open Save As...
-        await saveMapAs(activeFileFormat);
+        // 3. First-time save of an unnamed map: prompt for location WITHOUT rotating its existing mapId/fileSyncToken
+        await saveMapAs(activeFileFormat, false);
       }
 
       async function loadFileContent(name, text, handle = null) {
         let imported;
+        let migratedToken = false;
         const fmt = detectFormatFromName(name);
-        if (fmt === 'json') imported = importFromJSON(text);
-        else if (fmt === 'mm') imported = importFromFreeMindMM(text);
-        else imported = importFromMarkdown(text);
+        if (fmt === 'json') {
+          const res = importFromJSON(text);
+          imported = res.state;
+          migratedToken = res.migratedToken;
+        } else if (fmt === 'mm') {
+          imported = importFromFreeMindMM(text);
+          migratedToken = true;
+        } else {
+          imported = importFromMarkdown(text);
+          migratedToken = true;
+        }
 
         activeFileHandle = handle;
         activeFileFormat = fmt;
         customFileName = name;
         await saveFileHandleToIDB(handle, name, fmt);
         commitState(imported, false);
-        updateFileBadge(name, false);
+        updateFileBadge(name, migratedToken);
         if (handle) {
           try {
             const f = await handle.getFile();
             lastKnownDiskModified = f.lastModified;
           } catch {}
         }
-        connectInvisibleCrossDeviceSync();
-        setSaveStatus(handle ? 'saved' : 'local', handle ? `Linked to ${name}` : `Loaded ${name}`);
+        connectInvisibleCrossDeviceSync(true);
+        pushStateToCrossDeviceSync(true);
+        if (migratedToken && fmt === 'json') {
+          setSaveStatus('saving', 'Upgraded sync token · Save file to persist');
+          showToast('Added 256-bit sync token — press Save (Ctrl+S) to update file');
+        } else {
+          setSaveStatus(handle ? 'saved' : 'local', handle ? `Linked to ${name}` : `Loaded ${name}`);
+          showToast(`Opened ${name}`);
+        }
         fitToScreen();
-        showToast(`Opened ${name}`);
       }
 
+      // ADR-037: Mobile File Open Ergonomics — always use clean <input type="file"> on mobile/touch viewports
       async function openMapFromDisk() {
-        if ('showOpenFilePicker' in window) {
+        const isMobile = window.innerWidth <= 820 || window.matchMedia('(pointer: coarse)').matches;
+        if (!isMobile && 'showOpenFilePicker' in window) {
           try {
             const [handle] = await window.showOpenFilePicker({
               multiple: false,
@@ -4597,7 +5145,6 @@
                 }
               ]
             });
-            // Request readwrite permission immediately while inside the user gesture so auto-save & first Ctrl+S never prompt for location
             try {
               if (typeof handle.queryPermission === 'function') {
                 const perm = await handle.queryPermission({ mode: 'readwrite' });
@@ -4906,45 +5453,11 @@
         if (url) window.open(url, '_blank', 'noopener');
       };
 
-      // Multi-Tab BroadcastChannel Conflict Detection & Live Sync (ADR-018)
+      // Multi-Tab BroadcastChannel Conflict Banner Controls (ADR-018 & ADR-037)
       const syncBanner = document.getElementById('syncBanner');
-      if (syncChannel) {
-        syncChannel.onmessage = (ev) => {
-          const msg = ev.data;
-          if (!msg || msg.type !== 'STATE_UPDATED' || msg.tabId === TAB_ID) return;
-          // If this tab has no unsaved edits in the last 10 seconds, auto-sync cleanly; otherwise show conflict banner
-          if (Date.now() - lastLocalMutationAt > 10000 && !currentState.editingId) {
-            currentState = hydrateAllNodeBounds({
-              ...msg.state,
-              selectedIds: msg.state.selectedIds || [msg.state.rootId],
-              editingId: null
-            });
-            if (msg.customFileName) customFileName = msg.customFileName;
-            syncAriaTreeMirror();
-            updateLayerBadge();
-            connectInvisibleCrossDeviceSync();
-        updateFileBadge(customFileName || currentState.nodesById[currentState.rootId]?.text || 'Central Topic', false);
-            requestRender();
-            showToast('Synced from other tab');
-          } else {
-            pendingRemoteState = msg;
-            syncBanner.classList.add('open');
-          }
-        };
-      }
       document.getElementById('btnAcceptSync').onclick = () => {
         if (pendingRemoteState?.state) {
-          currentState = hydrateAllNodeBounds({
-            ...pendingRemoteState.state,
-            selectedIds: pendingRemoteState.state.selectedIds || [pendingRemoteState.state.rootId],
-            editingId: null
-          });
-          if (pendingRemoteState.customFileName) customFileName = pendingRemoteState.customFileName;
-          syncAriaTreeMirror();
-          updateLayerBadge();
-          connectInvisibleCrossDeviceSync();
-        updateFileBadge(customFileName || currentState.nodesById[currentState.rootId]?.text || 'Central Topic', false);
-          requestRender();
+          applyIncomingRemoteState(pendingRemoteState.state, 'Synced tab');
         }
         pendingRemoteState = null;
         syncBanner.classList.remove('open');
@@ -4954,18 +5467,29 @@
         syncBanner.classList.remove('open');
       };
 
-      // Boot: Hydrate State + Persisted FileSystemFileHandle from IndexedDB
+      // Boot: Hydrate State from IndexedDB with Automatic 256-Bit fileSyncToken Migration (ADR-037)
       (async () => {
         applyBodyThemeAndFocus();
         const saved = await loadFromIndexedDB();
         if (saved && saved.rootId && saved.nodesById?.[saved.rootId]) {
+          const validToken = (typeof saved.fileSyncToken === 'string' && saved.fileSyncToken.length >= 32)
+            ? saved.fileSyncToken
+            : generateCryptoToken();
+          const validMapId = saved.mapId || ('map_' + saved.rootId);
           currentState = hydrateAllNodeBounds({
             ...saved,
+            mapId: validMapId,
+            fileSyncToken: validToken,
+            deletedById: saved.deletedById || {},
+            linksById: saved.linksById || {},
             selectedIds: saved.selectedIds || [saved.rootId],
             editingId: null
           });
           if (saved.customFileName) customFileName = saved.customFileName;
           if (saved.activeFileFormat) activeFileFormat = saved.activeFileFormat;
+          if (validToken !== saved.fileSyncToken || validMapId !== saved.mapId) {
+            await saveToIndexedDB(currentState, false);
+          }
         }
         const savedHandleObj = await loadFileHandleFromIDB();
         if (savedHandleObj?.name) customFileName = savedHandleObj.name;
@@ -4973,8 +5497,8 @@
         resizeCanvas();
         syncAriaTreeMirror();
         updateLayerBadge();
-        connectInvisibleCrossDeviceSync();
-        updateFileBadge(customFileName || currentState.nodesById[currentState.rootId]?.text || 'Central Topic', false);
+        connectInvisibleCrossDeviceSync(true);
+        updateFileBadge(customFileName || currentState.nodesById[currentState.rootId]?.text || 'ThoughtTree', false);
         requestRender();
       })();
     })();
