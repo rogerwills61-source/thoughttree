@@ -442,8 +442,10 @@
   <meta name="theme-color" content="#0f172a" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="./icon.svg" />
   <script>
-    // ADR-025, ADR-035 & ADR-036: ThoughtTree PWA Manifest, 192/512px PNG Auto-Rasterizer & Offline Service Worker
+    // ADR-025, ADR-036 & ADR-042: ThoughtTree Real Offline Service Worker (./sw.js), Manifest (./manifest.json) & iOS Icon Rasterizer
     window.__deferredPwaPrompt = null;
     window.addEventListener('beforeinstallprompt', (e) => {
       e.preventDefault();
@@ -454,124 +456,33 @@
 
     (() => {
       try {
-        // Custom ThoughtTree Emblem: Luminous organic branching canopy with connected thought nodes on a deep slate squircle
-        const iconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-          <defs>
-            <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stop-color="#0f172a"/>
-              <stop offset="100%" stop-color="#1e293b"/>
-            </linearGradient>
-            <linearGradient id="trunkGrad" x1="0" y1="1" x2="1" y2="0">
-              <stop offset="0%" stop-color="#2563eb"/>
-              <stop offset="100%" stop-color="#38bdf8"/>
-            </linearGradient>
-          </defs>
-          <rect width="512" height="512" rx="116" fill="url(#bgGrad)" stroke="#334155" stroke-width="8"/>
-          <path d="M256 410 L256 265 M256 290 C256 235, 148 220, 148 156 M256 290 C256 235, 364 220, 364 156 M256 265 L256 122 M148 156 C148 118, 96 112, 96 84 M364 156 C364 118, 416 112, 416 84" stroke="url(#trunkGrad)" stroke-width="22" stroke-linecap="round" fill="none"/>
-          <circle cx="256" cy="410" r="34" fill="#1d4ed8" stroke="#60a5fa" stroke-width="12"/>
-          <circle cx="256" cy="116" r="42" fill="#0284c7" stroke="#38bdf8" stroke-width="12"/>
-          <circle cx="148" cy="156" r="36" fill="#0f766e" stroke="#2dd4bf" stroke-width="12"/>
-          <circle cx="364" cy="156" r="36" fill="#0f766e" stroke="#2dd4bf" stroke-width="12"/>
-          <circle cx="96" cy="84" r="22" fill="#2dd4bf"/>
-          <circle cx="416" cy="84" r="22" fill="#38bdf8"/>
-        </svg>`;
-        const svgUrl = 'data:image/svg+xml;utf8,' + encodeURIComponent(iconSvg);
-        window.__thoughtTreeSvgUrl = svgUrl;
+        window.__thoughtTreeSvgUrl = './icon.svg';
 
-        const fav = document.createElement('link');
-        fav.rel = 'icon';
-        fav.type = 'image/svg+xml';
-        fav.href = svgUrl;
-        document.head.appendChild(fav);
-
-        const buildManifest = (png192, png512) => {
-          const icons = [
-            { src: svgUrl, sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }
-          ];
-          if (png192) icons.push({ src: png192, sizes: '192x192', type: 'image/png', purpose: 'any maskable' });
-          if (png512) icons.push({ src: png512, sizes: '512x512', type: 'image/png', purpose: 'any maskable' });
-
-          const manifest = {
-            name: 'ThoughtTree — Mind Mapping',
-            short_name: 'ThoughtTree',
-            description: 'Zero-clutter, keyboard-first 60 FPS cross-platform mind mapping app with live CRDT sync.',
-            start_url: location.href.split('#')[0],
-            scope: './',
-            display: 'standalone',
-            orientation: 'any',
-            background_color: '#0f172a',
-            theme_color: '#0f172a',
-            icons
-          };
-          let mLink = document.querySelector('link[rel="manifest"]');
-          if (!mLink) {
-            mLink = document.createElement('link');
-            mLink.rel = 'manifest';
-            document.head.appendChild(mLink);
-          }
-          mLink.href = 'data:application/manifest+json;utf8,' + encodeURIComponent(JSON.stringify(manifest));
-        };
-
-        // ADR-038: Attach lightweight SVG manifest immediately and defer 192/512px PNG rasterization
-        // until after first canvas render so mobile CPUs never stall on startup!
-        buildManifest(null, null);
+        // Defer iOS apple-touch-icon PNG rasterization until idle so first paint on mobile is never blocked
         const scheduleIdle = window.requestIdleCallback || ((cb) => setTimeout(cb, 280));
         window.addEventListener('load', () => {
           scheduleIdle(() => {
             const img = new Image();
             img.onload = () => {
               try {
-                const makePng = (sz) => {
-                  const c = document.createElement('canvas');
-                  c.width = sz; c.height = sz;
-                  c.getContext('2d').drawImage(img, 0, 0, sz, sz);
-                  return c.toDataURL('image/png');
-                };
-                const p192 = makePng(192);
-                const p512 = makePng(512);
+                const c = document.createElement('canvas');
+                c.width = 192; c.height = 192;
+                c.getContext('2d').drawImage(img, 0, 0, 192, 192);
                 const appleLink = document.createElement('link');
                 appleLink.rel = 'apple-touch-icon';
-                appleLink.href = p192;
+                appleLink.href = c.toDataURL('image/png');
                 document.head.appendChild(appleLink);
-                buildManifest(p192, p512);
               } catch {}
             };
-            img.src = svgUrl;
+            img.src = './icon.svg';
           });
         });
 
-        // ADR-038: Stale-While-Revalidate (Cache-First) Service Worker so mobile PWA launches in <30ms
-        // while silently updating the cache in the background!
+        // ADR-042: Register real same-origin ./sw.js (replaces blob: URLs silently rejected by Chrome/Safari)
         if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
-          const swCode = `
-            const CACHE = 'thoughttree-pwa-v30';
-            self.addEventListener('install', () => { self.skipWaiting(); });
-            self.addEventListener('activate', (e) => {
-              e.waitUntil(
-                caches.keys().then((keys) => Promise.all(
-                  keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))
-                )).then(() => self.clients.claim())
-              );
-            });
-            self.addEventListener('fetch', (e) => {
-              if (e.request.method !== 'GET') return;
-              e.respondWith(
-                caches.open(CACHE).then((cache) =>
-                  cache.match(e.request).then((cachedRes) => {
-                    const fetchPromise = fetch(e.request).then((netRes) => {
-                      if (netRes && netRes.status === 200) {
-                        cache.put(e.request, netRes.clone()).catch(() => {});
-                      }
-                      return netRes;
-                    }).catch(() => cachedRes);
-                    return cachedRes || fetchPromise;
-                  })
-                )
-              );
-            });
-          `;
-          const blob = new Blob([swCode], { type: 'application/javascript' });
-          navigator.serviceWorker.register(URL.createObjectURL(blob)).catch(() => {});
+          window.addEventListener('load', () => {
+            navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(() => {});
+          });
         }
       } catch {}
     })();

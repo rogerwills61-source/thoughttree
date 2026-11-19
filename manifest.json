@@ -1,0 +1,19 @@
+{
+  "name": "ThoughtTree \u2014 Mind Mapping",
+  "short_name": "ThoughtTree",
+  "description": "Zero-clutter, keyboard-first 60 FPS cross-platform mind mapping app with live CRDT sync.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
