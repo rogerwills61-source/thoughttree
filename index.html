@@ -544,7 +544,7 @@
         // while silently updating the cache in the background!
         if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
           const swCode = `
-            const CACHE = 'thoughttree-pwa-v29';
+            const CACHE = 'thoughttree-pwa-v30';
             self.addEventListener('install', () => { self.skipWaiting(); });
             self.addEventListener('activate', (e) => {
               e.waitUntil(
@@ -599,7 +599,7 @@
           <span>Menu</span>
           <span style="font-size:10px; opacity:0.8;">▾</span>
         </button>
-        <input type="file" id="fileInput" style="display:none" />
+        <input type="file" id="fileInput" accept="application/json,text/plain,text/xml,.json,.md,.mm" style="display:none" />
 
         <button class="hud-btn icon-btn" id="btnSettings" title="UI & Canvas Settings (Ctrl/Cmd+,)" aria-label="Settings">
           <svg class="hud-icon cog-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -2192,9 +2192,17 @@
         }
       }
 
-      // Automatic Wake / Network-Switch Self-Healing Listeners
+      // Automatic Wake / Network-Switch Self-Healing Listeners (ADR-041: File-Picker Wake Collision Guard)
+      let isOpeningFilePicker = false;
+      let suppressWakeSyncUntil = 0;
       function healSyncConnectionsOnWake() {
         if (document.visibilityState === 'hidden') return;
+        if (isOpeningFilePicker) {
+          isOpeningFilePicker = false;
+          suppressWakeSyncUntil = Date.now() + 1500;
+          return;
+        }
+        if (Date.now() < suppressWakeSyncUntil) return;
         connectInvisibleCrossDeviceSync(false);
         sendEnvelopeOverMqtt({
           type: 'sync-hello',
@@ -5224,9 +5232,9 @@
           migratedToken = true;
         }
 
-        // ADR-040: Skip redundant O(N) applyAutoLayout calculation when opening saved .json files
-        // that already contain pre-calculated node positions, making file open instant on mobile!
-        const needsLayout = Object.values(imported.nodesById || {}).some((n) => !n.position || (n.position.x === 0 && n.position.y === 0));
+        // ADR-040 & ADR-041: Skip redundant O(N) applyAutoLayout calculation when opening saved .json files
+        // that already contain pre-calculated node positions (excluding rootId which legitimately sits at 0,0).
+        const needsLayout = Object.values(imported.nodesById || {}).some((n) => n.id !== imported.rootId && (!n.position || (n.position.x === 0 && n.position.y === 0)));
         if (needsLayout) {
           imported = applyAutoLayout(imported);
         }
@@ -5307,6 +5315,7 @@
             if (err && err.name === 'AbortError') return;
           }
         }
+        isOpeningFilePicker = true;
         document.getElementById('fileInput').click();
       }
 
