@@ -1,10 +1,12 @@
-// ThoughtTree Offline Service Worker (ADR-042 — v2.31)
-const CACHE = 'thoughttree-pwa-v31';
+// ThoughtTree Offline Service Worker (ADR-042 & ADR-043 — v2.32)
+const CACHE = 'thoughttree-pwa-v32';
 const CORE_ASSETS = [
   './',
   './index.html',
   './manifest.json',
-  './icon.svg'
+  './icon.svg',
+  './icon-192.png',
+  './icon-512.png'
 ];
 
 self.addEventListener('install', (event) => {
